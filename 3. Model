@@ -1,0 +1,152 @@
+xlibrary(RPostgreSQL)
+
+#path to components directory
+mercurial_path ="C://mercurial/Components/"
+
+# Database parameters
+my.db.connect <- function() {
+  dbConnect(drv = PostgreSQL(),
+            user = "",
+            dbname = "smt_cap",
+            host = "", 
+            port = "")
+}
+
+# Read  input data from the database: 
+conn <- my.db.connect()
+
+d.fit <- dbGetQuery(conn, paste("SELECT * FROM data.modelling_data_matrix_weather where source_period_end_time >'08-21-2012'::date and source_period_end_time < '12-15-2013'::date ;"))
+
+d.apply <- dbGetQuery(conn, paste("SELECT * FROM data.modelling_data_matrix_weather where source_period_end_time >='12-15-2013'::date and source_period_end_time < '06-07-2014'::date ;"))
+
+dbDisconnect(conn)
+
+
+# Create metadata form template model
+metadata <- matrix(NA,nrow=0,ncol=2)
+colnames(metadata) <- c("key","value")
+
+metadata <- rbind(metadata, 
+                  c("model_type",  "logistic"),
+                  c("use_case",    "capoc_pe_node"),
+                  c("target_name", "target"),
+                  c("is_parent",   "true"), 
+                  c("model_name",  "capoc_template_model")    
+)                
+
+# Read template model input format from csv file
+source(paste(mercurial_path,"/Regression/R-Prototypes/template_input_format.r", sep=""))
+tmp.input.format <- tmp.input.format.csv2r("C:/Deployment/models/capoc_template_model_test_all.csv")
+
+
+
+tmp.model <- c(tmp.input.format, list(metadata = metadata))
+
+#do automatic preprocessing i.e. create premodel
+source(paste(mercurial_path,"/Regression/R-Prototypes/template_model_to_premodel.r", sep=""))
+pre.model = tmpmodel2premodel(d.fit, tmp.model,0.03,0.01)
+
+wd <- getwd()
+setwd("C:/mercurial/Components/Regression/R-Prototypes")
+source("lr.r")
+setwd(wd)
+source(paste(mercurial_path,"/Regression/R-Prototypes/glm_plots.r", sep=""))
+source(paste(mercurial_path,"/Regression/R-Prototypes/input_matrix.r", sep=""))
+
+# Preprocess the data: 
+x.fit <- input.matrix(x = d.fit, format.x = pre.model, file.name = paste("capoc_pe_node_distributions_fit.pdf", sep=""))
+x.apply <- input.matrix(x = d.apply, format.x = pre.model, file.name = paste("capoc_pe_node_distributions_apply.pdf", sep=""))
+# using churn_inactivity now as an example, y is the target vector having -1/1 (churned/not churned)  
+y.fit <- d.fit$target
+y.apply <- d.apply$target
+
+
+is.tr <- runif(length(y.fit)) > 0.5
+
+# Specify the regularization parameters
+weight <- matrix(1, 1, ncol(x.fit))
+obj <- lr.maxlambda(x.fit[is.tr,], y.fit[is.tr], weight)
+seqlam <- function(maxlam, minlam=min(1e-7,maxlam), numlam=20)
+  10^seq(log10(maxlam), log10(minlam), length=numlam)
+lambda <- apply(obj$lambda, 2, seqlam)
+
+cat("Lambda:\n")
+cat(lambda[,1])
+cat("Log10(Lambda):\n")
+cat(log10(lambda[,1]))
+
+
+# Fit a sequence of models and compute training and validation errors
+# See also functions lr_lasso_cv.r and lr_lasso_bootstrap.r
+{  
+  w <- lr.lasso(x.fit[is.tr,], y.fit[is.tr], lambda, obj$w)
+  save.image(paste("cap_fit_mji_fit.rdata", sep=""))
+}
+
+e.tr <- lr.error(x.fit[is.tr,], y.fit[is.tr], w)
+
+#Fix the intercept (if uneven sampling was used)
+w.orig <- w
+w[,"intercept"] <- w[,"intercept"] + log(shrink.coeff)
+
+e.va <- lr.error(x.fit[!is.tr,], y.fit[!is.tr], w)
+
+# Select the regularization parameters with the lowest validation error 
+ind.min <- which.min(e.va)
+w.min <- w[ind.min, , drop=FALSE]
+ind.min
+
+# Calculate lift
+p.fit <- lr.predict(x.fit, w.min)
+p.apply <- lr.predict(x.apply, w.min)
+
+y <- y.fit
+p <- p.fit
+x <- x.fit
+
+sqp <- seq(0.05, 0.95, by = 0.05)
+lift <- liftchart(score = p, target = y, score_quantile_probs = sqp)
+
+
+# Plot results
+pdf(paste("rnc_restart_using_all2.pdf", sep=""), width = 12, height = 8.5)
+par(mfcol=c(1, 2))
+matplot(log10(lambda[,1]), w[,1:ncol(x)], type="b",
+        xlab="log10(lambda)", ylab="Model parameters")
+lines(rep(log10(lambda[ind.min,1]), 2), c(-1e6, 1e6))
+matplot(log10(lambda[,1]), cbind(e.tr, e.va), type="b",
+        xlab="log10(lambda)", ylab="Training and validation errors")
+lines(rep(log10(lambda[ind.min,1]), 2), c(-1e6, 1e6))
+par(mfcol=c(1, 1))
+barplot(w.min, las = 2, horiz = TRUE, cex.names = 0.5)
+barplot(matrix(lift[, "lift"], nrow = 1), names.arg = rownames(lift))
+
+## Cumulative gain curve
+for (i in 1:2) {
+  if (i == 1) {
+    y.plot <- y.fit
+    p.plot <- p.fit
+    chart.title <- "Cumulative gain, fit (source period 08-21-2012 - 07-14-2013)"
+  } else if (i == 2) {
+    y.plot <- y.apply
+    p.plot <- p.apply
+    chart.title <- "Cumulative gain, apply (target period 07-15-2013 -06-07-2014)"
+  }
+  gain.y <- cumsum((y.plot==1)[order(p.plot,decreasing=TRUE)]) / sum(y.plot==1) #seq(1,length(y.new))
+  gain.x <- seq(1,length(y.plot)) / length(y.plot)
+  plot(gain.x, gain.y, type = "l", col = "red", xlab = "Top proportion of score list", ylab = paste("Share of RNC restart producing controllers"),
+     main = chart.title, xlim = c(0, 1), ylim = c(0, 1))
+  lines(c(-1,2),c(-1,2))
+  lines(c(0,sum(y==1) / length(y)),c(0,1))
+  abline(1,0)
+}
+dev.off()
+
+#Write cumgain chart to file
+write(t(cbind(gain.x,gain.y)), ncolumns = 2, file="rnc_restart_using_all_cumgain1.csv")
+
+#write model coefficients to file
+weight.names <- dimnames(w.min)[[2]]
+write(t(cbind(row.names = weight.names[order(abs(w.min), decreasing = TRUE)], w.min[1,order(abs(w.min), decreasing = TRUE)])), 
+      file = "rnc_restart_using_all_model_coefficients1.csv", ncolumns = 2)
+
